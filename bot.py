@@ -9,9 +9,9 @@ import logging
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import google.generativeai as genai
-from telegram import Update, ReplyKeyboardMarkup, ChatAction
-from telegram.constants import ParseMode
+from groq import Groq
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
+from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY, GROQ_MODEL
 from rag_engine import RAGEngine
 
 # Настройка логирования
@@ -31,14 +31,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+# Инициализация Groq API
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Инициализация RAG движка
 rag_engine = RAGEngine()
 
-# Системный промпт для Gemini
+# Системный промпт для LLM
 SYSTEM_PROMPT = """Ты — ИИ-наставник первокурсника Satbayev University. Твоя задача — помогать студентам адаптироваться к обучению в университете.
 
 Правила:
@@ -49,12 +48,7 @@ SYSTEM_PROMPT = """Ты — ИИ-наставник первокурсника S
 5. Давай конкретные ответы с номерами кабинетов, телефонами и email
 6. Используй эмодзи умеренно
 7. Если вопрос не связан с университетом — вежливо верни к теме
-8. Не выдумывай информацию которой нет в контексте
-
-Контекст из базы знаний:
-{context}
-
-Вопрос студента: {question}"""
+8. Не выдумывай информацию которой нет в контексте"""
 
 # Клавиатура с основными кнопками
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -78,6 +72,31 @@ BUTTON_QUERIES = {
 }
 
 
+def ask_llm(context_text: str, question: str) -> str:
+    """Отправляет запрос в Groq API и возвращает ответ.
+
+    Args:
+        context_text: Контекст из базы знаний.
+        question: Вопрос пользователя.
+
+    Returns:
+        Текст ответа от LLM.
+    """
+    user_message = f"Контекст из базы знаний:\n{context_text}\n\nВопрос студента: {question}"
+
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.3,
+        max_tokens=2048,
+    )
+
+    return response.choices[0].message.content
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start — приветственное сообщение."""
     user = update.effective_user
@@ -85,7 +104,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     welcome_text = (
         f"Привет, {user.first_name}! 👋\n\n"
-        "Я — **ИИ-наставник первокурсника Satbayev University**! 🎓\n\n"
+        "Я — ИИ-наставник первокурсника Satbayev University! 🎓\n\n"
         "Задай мне любой вопрос об университете, и я постараюсь помочь:\n\n"
         "🏛 Структура университета и институты\n"
         "📚 Учебный процесс, оценки и GPA\n"
@@ -99,18 +118,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         welcome_text,
         reply_markup=MAIN_KEYBOARD,
-        parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help — описание возможностей бота."""
     help_text = (
-        "🤖 **Что я умею:**\n\n"
+        "🤖 Что я умею:\n\n"
         "Я — ИИ-наставник, созданный для помощи первокурсникам Satbayev University. "
         "Я использую технологию RAG (Retrieval-Augmented Generation) для поиска "
         "актуальной информации по базе знаний университета.\n\n"
-        "📌 **Я могу помочь с:**\n"
+        "📌 Я могу помочь с:\n"
         "• Информация об институтах и кафедрах\n"
         "• Учебный процесс, кредиты, GPA\n"
         "• Система оценок и аттестации\n"
@@ -122,7 +140,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Студенческие организации\n"
         "• Часто задаваемые вопросы\n\n"
         "💬 Просто напиши свой вопрос или используй кнопки меню!\n\n"
-        "📌 **Команды:**\n"
+        "📌 Команды:\n"
         "/start — Начать работу с ботом\n"
         "/help — Показать эту справку"
     )
@@ -130,7 +148,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         help_text,
         reply_markup=MAIN_KEYBOARD,
-        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -151,14 +168,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context_text = rag_engine.get_context(query)
         logger.info(f"Контекст получен ({len(context_text)} символов)")
 
-        # Формируем промпт для Gemini
-        prompt = SYSTEM_PROMPT.format(context=context_text, question=query)
-
-        # Отправляем запрос в Gemini API
-        response = gemini_model.generate_content(prompt)
-
-        # Получаем текст ответа
-        answer = response.text
+        # Отправляем запрос в Groq API
+        answer = ask_llm(context_text, query)
 
         # Обрезаем ответ если он слишком длинный для Telegram
         if len(answer) > 4000:
@@ -201,11 +212,11 @@ def main() -> None:
     doc_count = rag_engine.collection.count()
     if doc_count == 0:
         logger.warning(
-            "⚠️  База знаний пуста! "
+            "База знаний пуста! "
             "Сначала запустите: python knowledge_loader.py"
         )
     else:
-        logger.info(f"📚 В базе знаний {doc_count} записей")
+        logger.info(f"В базе знаний {doc_count} записей")
 
     # Создаём приложение бота
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -216,7 +227,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Запускаем бота
-    logger.info("🤖 Бот запущен и ожидает сообщений...")
+    logger.info("Бот запущен и ожидает сообщений...")
     app.run_polling(drop_pending_updates=True)
 
 
